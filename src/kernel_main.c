@@ -13,9 +13,78 @@ uint8_t inb (uint16_t _port) {
     return rv;
 }
 
+// --- Constants for Screen Dimensions ---
+#define VIDEO_WIDTH 80  // Characters per line
+#define VIDEO_HEIGHT 25 // Lines on the screen
+#define BYTES_PER_CHAR 2 // Character and attribute byte
+
+// --- Function to write a single character ---
+void putc(int data) {
+    char character = (char)data; // Cast the input to a char
+   char *vram = (char*)0xb8000; // Base address of video mem
+ int current_offset; // Tracks the current position in video memory
+    // Write the character to the video memory
+    vram[current_offset] = character;
+    // Write a default attribute byte (e.g., white on black)
+    vram[current_offset + 1] = 0x0F;
+
+    // Increment the offset to the next character position
+    current_offset += BYTES_PER_CHAR;
+
+    // Handle newline character
+    if (character == '\n') {
+        // Move to the beginning of the next line
+        current_offset = (current_offset / (VIDEO_WIDTH * BYTES_PER_CHAR)) * (VIDEO_WIDTH * BYTES_PER_CHAR);
+    }
+
+    // Handle screen wrap-around (optional, but good practice)
+    if (current_offset >= VIDEO_WIDTH * VIDEO_HEIGHT * BYTES_PER_CHAR) {
+        // If at the end of the screen, reset to the beginning of video memory
+        current_offset = 0;
+        // You might also want to scroll the entire screen content up here
+    }
+}
+
+
 void main() {
-    unsigned short *vram = (unsigned short*)0xb8000; // Base address of video mem
-    const unsigned char color = 7; // gray text on black background
+    char *vram = (char*)0xb8000; // Base address of video mem
+    const char color = 7; // gray text on black background
+    int current_offset = 0;
+
+    putc('I');
+    putc(' ');
+    putc('h');
+    putc('a');
+    putc('v');
+    putc('e');
+    putc(' ');
+    putc('f');
+    putc('r');
+    putc('i');
+    putc('e');
+    putc('n');
+    putc('d');
+    putc('s');
+    putc(' ');
+    putc('e');
+    putc('v');
+    putc('e');
+    putc('r');
+    putc('y');
+    putc('w');
+    putc('h');
+    putc('e');
+    putc('r');
+    putc('e');
+    putc('.');
+
+
+    putc('\n'); 
+
+
+
+
+
 
     while(1) {
         uint8_t status = inb(0x64);
@@ -23,47 +92,4 @@ void main() {
             uint8_t scancode = inb(0x60);
         }
     }
-}
-
-unsigned int screen_offset = 0;
-
-typedef struct {
-	char character;
-	char color;
-}
-char_entry;
-
-volatile char_entry *video_memory = (char_entry *)0xB8000;
-
-void putc(int data) {
-	if (screen_offset >= 4000) {
-		return;
-	}
-
-	char_entry entry = {
-		.character = (char)data,
-		.color = 0x0F
-	};
-
-	video_memory[screen_offset] = entry;
-
-	screen_offset++;
-}
-
-
-#define SCREEN_WIDTH 80
-#define SCREEN_HEIGHT 25
-char screen_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];
-
-void scroll_screen_up(void) {
-	int row, col;
-	for (row = 1; row < SCREEN_HEIGHT; row++) {
-		for (col = 0; col < SCREEN_WIDTH; col++) {
-			screen_buffer[row - 1][col] = screen_buffer[row][col];
-			}
-		}
-	for (col = 0; col < SCREEN_WIDTH; col++) {
-		screen_buffer[SCREEN_HEIGHT - 1][col] = ' ';
-	}
-}
-	
+}	
