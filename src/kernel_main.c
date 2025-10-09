@@ -3,8 +3,11 @@
 #include <string.h>
 #include <stdarg.h>
 #include "rprintf.h"
+#include <stdbool.h>
 
 #define MULTIBOOT2_HEADER_MAGIC         0xe85250d6
+#define PS2_STATUS_PORT 0X64
+#define PS2_DATA_PORT 0X60
 
 const unsigned int multiboot_header[]  __attribute__((section(".multiboot"))) = {MULTIBOOT2_HEADER_MAGIC, 0, 16, -(16+MULTIBOOT2_HEADER_MAGIC), 0, 12};
 
@@ -356,8 +359,40 @@ void terminal_putc(char c) {
 uint32_t get_cpl() {
     uint32_t cs;
     asm volatile("movl %%cs, %0" : "=r"(cs));
-    return cs & 0x3; // The CPL is in the lower 2 bits of the CS register.
+    return cs & 0x3;
 }
+
+
+
+
+
+// I/O port write function (not used here, but useful for PS/2 work)
+static inline void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile ("outb %0, %1"
+                      :
+                      : "a"(val), "Nd"(port));
+}
+
+// Check if output buffer of PS/2 controller is full
+bool is_output_buffer_full() {
+    uint8_t status = inb(0x64);  // PS/2 status register
+    return status & 0x01;        // Check LSB
+}
+
+// Entry point for reading scancode
+void read_scancode_once() {
+    if (is_output_buffer_full()) {
+        uint8_t scancode = inb(0x60);  // Read scancode from data port
+        // Print to terminal — assumes you have a way to print (e.g., via VGA or serial)
+    }
+}
+
+
+
+
+
+
+
 
 void main() {
     char *vram = (char*)0xb8000; // Base address of video mem
@@ -399,6 +434,8 @@ esp_printf((func_ptr)terminal_putc, ctrl_str, get_cpl());
         uint8_t status = inb(0x64);
         if(status & 1) {
             uint8_t scancode = inb(0x60);
+	    void read_scancode_once();
+		esp_printf((func_ptr)terminal_putc, "Scancode: 0x%02X\n", scancode);
         }
     }
 }	
