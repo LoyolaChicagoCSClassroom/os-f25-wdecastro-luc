@@ -4,6 +4,10 @@
 #include <stdarg.h>
 #include "rprintf.h"
 #include <stdbool.h>
+#include "page.h"
+
+
+
 
 #define MULTIBOOT2_HEADER_MAGIC         0xe85250d6
 #define PS2_STATUS_PORT 0X64
@@ -429,6 +433,10 @@ void main() {
  
 const char* ctrl_str = "Current Execution Level: %d\n";
 esp_printf((func_ptr)terminal_putc, ctrl_str, get_cpl());
+
+init_pfa_list();
+    struct ppage* block = allocate_physical_pages(2);
+free_physical_pages(block);
 
     while(1) {
         uint8_t status = inb(0x64);
