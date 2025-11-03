@@ -7,8 +7,8 @@ cleanup() {
 
 trap cleanup EXIT
 
-screen -S qemu -d -m qemu-system-i386 -S -s -hda rootfs.img
+screen -S qemu -d -m qemu-system-i386 -S -s -hda rootfs.img -monitor stdio
 
-TERM=xterm gdb-multiarch -x gdb_os.txt
+TERM=xterm gdb-multiarch -x gdb_os.txt && killall qemu-system-i386
 
 

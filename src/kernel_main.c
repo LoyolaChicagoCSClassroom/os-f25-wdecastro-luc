@@ -392,10 +392,74 @@ void read_scancode_once() {
 }
 
 
+extern struct page_directory_entry pd[1024];
+extern struct page_entry pt[1024];
 
+void *map_pages(void *vaddr, struct ppage *pglist, struct page_directory_entry *pd)
+{
+    uint32_t va = (uint32_t)vaddr;
+    struct ppage *curr = pglist;
 
+    // Extract directory and table indices
+    uint32_t dir_index = (va >> 22) & 0x3FF;
+    uint32_t tbl_index = (va >> 12) & 0x3FF;
 
+    // If the page directory entry is not present, set it up
+    if (!pd[dir_index].present) {
+        pd[dir_index].present = 1;
+        pd[dir_index].rw = 1;        // Read/write
+        pd[dir_index].user = 0;      // Kernel-only
+        pd[dir_index].frame_number = ((uint32_t)&pt) >> 12;  // Page table physical addr
+    }
 
+    // Map each page in the list
+    while (curr != NULL) {
+        pt[tbl_index].present = 1;
+        pt[tbl_index].rw = 1;
+        pt[tbl_index].user = 0;
+        pt[tbl_index].frame_number = curr->frame_number;  // store high 20 bits
+
+        // Move to next page
+        curr = curr->next;
+        tbl_index++;
+
+        // Handle page table overflow (rare)
+        if (tbl_index >= 1024) {
+            dir_index++;
+            tbl_index = 0;
+            // In a full implementation, allocate a new page table here
+        }
+    }
+
+    return vaddr;
+}
+
+extern char _end_kernel;
+
+static inline void load_page_directory(uint32_t *pd_phys_addr)
+{
+    asm volatile("mov %0, %%cr3" :: "r"(pd_phys_addr) : "memory");
+}
+
+void loadPageDirectory(struct page_directory_entry *pd) {
+    asm volatile (
+        "mov %0, %%cr3"  // Load the physical address of the page directory into CR3
+        :
+        : "r"(pd)        // Input: The page directory address
+        : "memory"       // Clobber memory since we are modifying a control register
+    );
+}
+
+void enable_paging(void) {
+    asm volatile (
+        "mov %%cr0, %%eax\n"        // Load CR0 into EAX
+        "or $0x80000001, %%eax\n"   // Set bit 31 (paging) and bit 0 (protected mode)
+        "mov %%eax, %%cr0\n"        // Store the modified value back to CR0
+        :                           // No output operands
+        :                           // No input operands
+        : "%eax"                    // Clobber EAX register
+    );
+}
 
 
 void main() {
@@ -403,40 +467,62 @@ void main() {
     const char color = 7; // gray text on black background
     int current_offset = 0;
 
-    putc(' ');
-    putc('I');
-    putc(' ');
-    putc('h');
-    putc('a');
-    putc('v');
-    putc('e');
-    putc(' ');
-    putc('f');
-    putc('r');
-    putc('i');
-    putc('e');
-    putc('n');
-    putc('d');
-    putc('s');
-    putc(' ');
-    putc('e');
-    putc('v');
-    putc('e');
-    putc('r');
-    putc('y');
-    putc('w');
-    putc('h');
-    putc('e');
-    putc('r');
-    putc('e');
-    putc('\n');
- 
-const char* ctrl_str = "Current Execution Level: %d\n";
-esp_printf((func_ptr)terminal_putc, ctrl_str, get_cpl());
+uint32_t start_addr = 0x100000;              // 1 MB
+    uint32_t end_addr   = (uint32_t)&_end_kernel;
 
-init_pfa_list();
-    struct ppage* block = allocate_physical_pages(2);
-free_physical_pages(block);
+    for (uint32_t addr = start_addr; addr < end_addr; addr += 0x1000) {
+    struct ppage tmp;
+    tmp.next = NULL;
+    tmp.frame_number = addr;   // ✅ physical == virtual
+    map_pages((void *)addr, &tmp, pd);
+}
+
+struct page_directory_entry pd[1024];  // Array of 1024 page directory entries
+struct page_entry pt[1024];  // Array of 1024 page table entries
+
+
+    // (b) Identity map the kernel stack
+    uint32_t esp;
+    asm("mov %%esp, %0" : "=r"(esp));
+
+    // Align the stack base down to a page boundary
+    uint32_t stack_page = esp & 0xFFFFF000;
+
+    // Map, for example, 4 stack pages (16 KB)
+    for (int i = 0; i < 4; i++) {
+        struct ppage tmp;
+        tmp.next = NULL;
+        tmp.frame_number = stack_page - (i * 0x1000);
+        map_pages((void *)(stack_page - (i * 0x1000)), &tmp, pd);
+    }
+
+    // (c) Identity map VGA text buffer (0xB8000)
+    {
+        struct ppage tmp;
+        tmp.next = NULL;
+        tmp.frame_number = 0xB8000;
+        map_pages((void *)0xB8000, &tmp, pd);
+    }
+
+load_page_directory((uint32_t *)pd);
+
+    asm volatile (
+        "mov %%cr0, %%eax\n"
+        "or $0x80000001, %%eax\n"
+        "mov %%eax, %%cr0"
+        :
+        :
+        : "eax"
+    );
+
+     char *vga = (char *)0xB8000;
+    vga[0] = 'O';
+    vga[1] = 0x0F;
+    vga[2] = 'K';
+    vga[3] = 0x0F;
+
+
+
 
     while(1) {
         uint8_t status = inb(0x64);
