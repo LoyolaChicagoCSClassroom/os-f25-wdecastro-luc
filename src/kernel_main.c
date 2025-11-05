@@ -461,7 +461,6 @@ void enable_paging(void) {
     );
 }
 
-
 void main() {
     char *vram = (char*)0xb8000; // Base address of video mem
     const char color = 7; // gray text on black background
@@ -505,31 +504,8 @@ struct page_entry pt[1024];  // Array of 1024 page table entries
     }
 
 load_page_directory((uint32_t *)pd);
-
-    asm volatile (
-        "mov %%cr0, %%eax\n"
-        "or $0x80000001, %%eax\n"
-        "mov %%eax, %%cr0"
-        :
-        :
-        : "eax"
-    );
-
-     char *vga = (char *)0xB8000;
-    vga[0] = 'O';
-    vga[1] = 0x0F;
-    vga[2] = 'K';
-    vga[3] = 0x0F;
-
-
-
+enable_paging();
 
     while(1) {
-        uint8_t status = inb(0x64);
-        if(status & 1) {
-            uint8_t scancode = inb(0x60);
-	    void read_scancode_once();
-		esp_printf((func_ptr)terminal_putc, "Scancode: 0x%02X\n", scancode);
-        }
     }
-}	
+}		
