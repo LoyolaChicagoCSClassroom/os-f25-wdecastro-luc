@@ -1,464 +1,572 @@
-
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdarg.h>
-#include "rprintf.h"
-#include <stdbool.h>
-#include "page.h"
 
+// VGA text mode buffer
+#define VGA_WIDTH  80
+#define VGA_HEIGHT 25
+#define VGA_MEMORY 0xB8000
 
+// VGA color codes
+#define VGA_COLOR_BLACK         0
+#define VGA_COLOR_BLUE          1
+#define VGA_COLOR_GREEN         2
+#define VGA_COLOR_CYAN          3
+#define VGA_COLOR_RED           4
+#define VGA_COLOR_MAGENTA       5
+#define VGA_COLOR_BROWN         6
+#define VGA_COLOR_LIGHT_GREY    7
+#define VGA_COLOR_DARK_GREY     8
+#define VGA_COLOR_LIGHT_BLUE    9
+#define VGA_COLOR_LIGHT_GREEN   10
+#define VGA_COLOR_LIGHT_CYAN    11
+#define VGA_COLOR_LIGHT_RED     12
+#define VGA_COLOR_LIGHT_MAGENTA 13
+#define VGA_COLOR_YELLOW        14
+#define VGA_COLOR_WHITE         15
 
+void vga_init(void);
+void vga_clear(void);
+void kputchar(char c);
+void kputs(const char* str);
+void print_string(const char* str);
+void print_dec(uint32_t num);
+void print_int(int32_t num);
+void print_hex(uint32_t num);
+void print_hex8(uint8_t num);
+void kprintf(const char* fmt, ...);
 
-#define MULTIBOOT2_HEADER_MAGIC         0xe85250d6
-#define PS2_STATUS_PORT 0X64
-#define PS2_DATA_PORT 0X60
+// FAT Boot Sector structure (FAT12/16/32)
+typedef struct {
+    uint8_t  jmp[3];                // Jump instruction
+    char     oem[8];                // OEM name
+    uint16_t bytes_per_sector;      // Bytes per sector
+    uint8_t  sectors_per_cluster;   // Sectors per cluster
+    uint16_t reserved_sectors;      // Reserved sectors
+    uint8_t  num_fats;              // Number of FATs
+    uint16_t root_entries;          // Root directory entries (FAT12/16)
+    uint16_t total_sectors_16;      // Total sectors (if < 65536)
+    uint8_t  media_type;            // Media descriptor
+    uint16_t sectors_per_fat_16;    // Sectors per FAT (FAT12/16)
+    uint16_t sectors_per_track;     // Sectors per track
+    uint16_t num_heads;             // Number of heads
+    uint32_t hidden_sectors;        // Hidden sectors
+    uint32_t total_sectors_32;      // Total sectors (if >= 65536)
+    
+    // FAT32 specific fields
+    uint32_t sectors_per_fat_32;    // Sectors per FAT (FAT32)
+    uint16_t flags;                 // Flags
+    uint16_t version;               // Version
+    uint32_t root_cluster;          // Root directory cluster (FAT32)
+    uint16_t fsinfo_sector;         // FSInfo sector
+    uint16_t backup_boot_sector;    // Backup boot sector
+    uint8_t  reserved[12];          // Reserved
+    uint8_t  drive_num;             // Drive number
+    uint8_t  reserved1;             // Reserved
+    uint8_t  boot_sig;              // Boot signature
+    uint32_t volume_id;             // Volume ID
+    char     volume_label[11];      // Volume label
+    char     fs_type[8];            // Filesystem type
+} __attribute__((packed)) FAT_BootSector;
 
-const unsigned int multiboot_header[]  __attribute__((section(".multiboot"))) = {MULTIBOOT2_HEADER_MAGIC, 0, 16, -(16+MULTIBOOT2_HEADER_MAGIC), 0, 12};
+// FAT Directory Entry structure
+typedef struct {
+    char     name[8];               // Filename (space-padded)
+    char     ext[3];                // Extension (space-padded)
+    uint8_t  attr;                  // File attributes
+    uint8_t  reserved;              // Reserved
+    uint8_t  create_time_tenth;     // Creation time (tenths of second)
+    uint16_t create_time;           // Creation time
+    uint16_t create_date;           // Creation date
+    uint16_t access_date;           // Last access date
+    uint16_t cluster_high;          // High word of first cluster (FAT32)
+    uint16_t modify_time;           // Modification time
+    uint16_t modify_date;           // Modification date
+    uint16_t cluster_low;           // Low word of first cluster
+    uint32_t file_size;             // File size in bytes
+} __attribute__((packed)) FAT_DirEntry;
 
-uint8_t inb (uint16_t _port) {
-    uint8_t rv;
-    __asm__ __volatile__ ("inb %1, %0" : "=a" (rv) : "dN" (_port));
-    return rv;
+// File attributes
+#define FAT_ATTR_READ_ONLY  0x01
+#define FAT_ATTR_HIDDEN     0x02
+#define FAT_ATTR_SYSTEM     0x04
+#define FAT_ATTR_VOLUME_ID  0x08
+#define FAT_ATTR_DIRECTORY  0x10
+#define FAT_ATTR_ARCHIVE    0x20
+#define FAT_ATTR_LFN        0x0F  // Long filename entry
+
+// FAT type enum
+typedef enum {
+    FAT_TYPE_12,
+    FAT_TYPE_16,
+    FAT_TYPE_32
+} FAT_Type;
+
+// Global FAT driver state
+typedef struct {
+    FAT_BootSector boot_sector;
+    uint8_t *fat_table;             // Pointer to FAT in memory
+    uint32_t fat_size;              // Size of FAT in bytes
+    uint32_t data_start_sector;     // First sector of data region
+    uint32_t root_dir_sectors;      // Sectors used by root directory
+    uint32_t first_data_sector;     // First sector containing data
+    FAT_Type fat_type;              // Type of FAT (12/16/32)
+    bool initialized;
+} FAT_State;
+
+static FAT_State g_fat_state = {0};
+
+// File handle structure
+typedef struct {
+    uint32_t first_cluster;         // First cluster of file
+    uint32_t current_cluster;       // Current cluster being read
+    uint32_t file_size;             // Total file size
+    uint32_t position;              // Current position in file
+    bool is_open;
+} FAT_FileHandle;
+
+// External functions you need to provide in your kernel:
+// - disk_read(sector, count, buffer): Read sectors from disk
+// - kmalloc(size): Allocate kernel memory
+// - kfree(ptr): Free kernel memory
+extern int disk_read(uint32_t sector, uint32_t count, void *buffer);
+extern void* kmalloc(size_t size);
+extern void kfree(void *ptr);
+
+// Helper function: Get total sectors
+static uint32_t get_total_sectors(FAT_BootSector *bs) {
+    return (bs->total_sectors_16 != 0) ? bs->total_sectors_16 : bs->total_sectors_32;
 }
 
+// Helper function: Get sectors per FAT
+static uint32_t get_sectors_per_fat(FAT_BootSector *bs) {
+    return (bs->sectors_per_fat_16 != 0) ? bs->sectors_per_fat_16 : bs->sectors_per_fat_32;
+}
 
+// Helper function: Determine FAT type
+static FAT_Type determine_fat_type(FAT_BootSector *bs) {
+    uint32_t total_sectors = get_total_sectors(bs);
+    uint32_t fat_size = get_sectors_per_fat(bs);
+    uint32_t root_dir_sectors = ((bs->root_entries * 32) + (bs->bytes_per_sector - 1)) / bs->bytes_per_sector;
+    uint32_t data_sectors = total_sectors - (bs->reserved_sectors + (bs->num_fats * fat_size) + root_dir_sectors);
+    uint32_t total_clusters = data_sectors / bs->sectors_per_cluster;
+    
+    if (total_clusters < 4085) {
+        return FAT_TYPE_12;
+    } else if (total_clusters < 65525) {
+        return FAT_TYPE_16;
+    } else {
+        return FAT_TYPE_32;
+    }
+}
 
+// Helper function: Get next cluster from FAT
+static uint32_t get_next_cluster(uint32_t cluster) {
+    uint32_t next_cluster = 0;
+    
+    switch (g_fat_state.fat_type) {
+        case FAT_TYPE_12: {
+            uint32_t fat_offset = cluster + (cluster / 2);  // multiply by 1.5
+            uint16_t fat_value = *(uint16_t*)&g_fat_state.fat_table[fat_offset];
+            
+            if (cluster & 1) {
+                next_cluster = fat_value >> 4;
+            } else {
+                next_cluster = fat_value & 0x0FFF;
+            }
+            
+            if (next_cluster >= 0x0FF8) next_cluster = 0xFFFFFFFF;  // EOC marker
+            break;
+        }
+        case FAT_TYPE_16: {
+            uint32_t fat_offset = cluster * 2;
+            next_cluster = *(uint16_t*)&g_fat_state.fat_table[fat_offset];
+            
+            if (next_cluster >= 0xFFF8) next_cluster = 0xFFFFFFFF;  // EOC marker
+            break;
+        }
+        case FAT_TYPE_32: {
+            uint32_t fat_offset = cluster * 4;
+            next_cluster = *(uint32_t*)&g_fat_state.fat_table[fat_offset] & 0x0FFFFFFF;
+            
+            if (next_cluster >= 0x0FFFFFF8) next_cluster = 0xFFFFFFFF;  // EOC marker
+            break;
+        }
+    }
+    
+    return next_cluster;
+}
 
+// Helper function: Get first sector of a cluster
+static uint32_t cluster_to_sector(uint32_t cluster) {
+    return ((cluster - 2) * g_fat_state.boot_sector.sectors_per_cluster) + g_fat_state.first_data_sector;
+}
 
-/*---------------------------------------------------*/
-/* Public Domain version of printf                   */
-/*                                                   */
-/* Rud Merriam, Compsult, Inc. Houston, Tx.          */
-/*                                                   */
-/* For Embedded Systems Programming, 1991            */
-/*                                                   */
-/*---------------------------------------------------*/
+/**
+ * fatInit - Initialize the FAT filesystem driver
+ * 
+ * Reads the boot sector and FAT table into memory.
+ * Must be called before using fatOpen or fatRead.
+ * 
+ * Returns: 0 on success, -1 on failure
+ */
+int fatInit(void) {
+    // Read boot sector
+    if (disk_read(0, 1, &g_fat_state.boot_sector) != 0) {
+        return -1;
+    }
+    
+    // Validate boot sector signature
+    uint8_t *boot_sig = (uint8_t*)&g_fat_state.boot_sector + 510;
+    if (boot_sig[0] != 0x55 || boot_sig[1] != 0xAA) {
+        return -1;
+    }
+    
+    // Calculate filesystem parameters
+    g_fat_state.fat_type = determine_fat_type(&g_fat_state.boot_sector);
+    
+    uint32_t fat_size = get_sectors_per_fat(&g_fat_state.boot_sector);
+    g_fat_state.root_dir_sectors = ((g_fat_state.boot_sector.root_entries * 32) + 
+                                    (g_fat_state.boot_sector.bytes_per_sector - 1)) / 
+                                    g_fat_state.boot_sector.bytes_per_sector;
+    
+    g_fat_state.first_data_sector = g_fat_state.boot_sector.reserved_sectors + 
+                                    (g_fat_state.boot_sector.num_fats * fat_size) + 
+                                    g_fat_state.root_dir_sectors;
+    
+    // Allocate memory for FAT table
+    g_fat_state.fat_size = fat_size * g_fat_state.boot_sector.bytes_per_sector;
+    g_fat_state.fat_table = (uint8_t*)kmalloc(g_fat_state.fat_size);
+    if (!g_fat_state.fat_table) {
+        return -1;
+    }
+    
+    // Read FAT table into memory
+    if (disk_read(g_fat_state.boot_sector.reserved_sectors, fat_size, g_fat_state.fat_table) != 0) {
+        kfree(g_fat_state.fat_table);
+        return -1;
+    }
+    
+    g_fat_state.initialized = true;
+    return 0;
+}
 
-#include "rprintf.h"
-/*---------------------------------------------------*/
-/* The purpose of this routine is to output data the */
-/* same as the standard printf function without the  */
-/* overhead most run-time libraries involve. Usually */
-/* the printf brings in many kiolbytes of code and   */
-/* that is unacceptable in most embedded systems.    */
-/*---------------------------------------------------*/
+/**
+ * fatOpen - Open a file in the FAT filesystem
+ * 
+ * Searches for the file in the root directory and initializes a file handle.
+ * Currently only supports files in the root directory.
+ * 
+ * @filename: Name of the file to open (8.3 format, e.g., "FILE.TXT")
+ * @handle: Pointer to file handle structure to initialize
+ * 
+ * Returns: 0 on success, -1 on failure
+ */
+int fatOpen(const char *filename, FAT_FileHandle *handle) {
+    if (!g_fat_state.initialized || !filename || !handle) {
+        return -1;
+    }
+    
+    // Parse filename into 8.3 format
+    char name[8] = "        ";
+    char ext[3] = "   ";
+    
+    const char *dot = strchr(filename, '.');
+    if (dot) {
+        int name_len = dot - filename;
+        if (name_len > 8) name_len = 8;
+        memcpy(name, filename, name_len);
+        
+        int ext_len = strlen(dot + 1);
+        if (ext_len > 3) ext_len = 3;
+        memcpy(ext, dot + 1, ext_len);
+    } else {
+        int name_len = strlen(filename);
+        if (name_len > 8) name_len = 8;
+        memcpy(name, filename, name_len);
+    }
+    
+    // Convert to uppercase
+    for (int i = 0; i < 8; i++) {
+        if (name[i] >= 'a' && name[i] <= 'z') name[i] -= 32;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (ext[i] >= 'a' && ext[i] <= 'z') ext[i] -= 32;
+    }
+    
+    // Read root directory
+    uint32_t root_dir_sector = g_fat_state.boot_sector.reserved_sectors + 
+                               (g_fat_state.boot_sector.num_fats * get_sectors_per_fat(&g_fat_state.boot_sector));
+    
+    FAT_DirEntry *dir_entries = (FAT_DirEntry*)kmalloc(g_fat_state.root_dir_sectors * g_fat_state.boot_sector.bytes_per_sector);
+    if (!dir_entries) {
+        return -1;
+    }
+    
+    if (disk_read(root_dir_sector, g_fat_state.root_dir_sectors, dir_entries) != 0) {
+        kfree(dir_entries);
+        return -1;
+    }
+    
+    // Search for file
+    uint32_t num_entries = (g_fat_state.root_dir_sectors * g_fat_state.boot_sector.bytes_per_sector) / sizeof(FAT_DirEntry);
+    bool found = false;
+    
+    for (uint32_t i = 0; i < num_entries; i++) {
+        FAT_DirEntry *entry = &dir_entries[i];
+        
+        // Check for end of directory
+        if (entry->name[0] == 0x00) break;
+        
+        // Skip deleted entries and LFN entries
+        if (entry->name[0] == 0xE5 || entry->attr == FAT_ATTR_LFN) continue;
+        
+        // Skip directories and volume labels
+        if (entry->attr & (FAT_ATTR_DIRECTORY | FAT_ATTR_VOLUME_ID)) continue;
+        
+        // Compare filename
+        if (memcmp(entry->name, name, 8) == 0 && memcmp(entry->ext, ext, 3) == 0) {
+            // File found!
+            uint32_t cluster = entry->cluster_low | ((uint32_t)entry->cluster_high << 16);
+            
+            handle->first_cluster = cluster;
+            handle->current_cluster = cluster;
+            handle->file_size = entry->file_size;
+            handle->position = 0;
+            handle->is_open = true;
+            
+            found = true;
+            break;
+        }
+    }
+    
+    kfree(dir_entries);
+    return found ? 0 : -1;
+}
 
-static func_ptr out_char;
-static int do_padding;
-static int left_flag;
-static int len;
-static int num1;
-static int num2;
-static char pad_character;
+/**
+ * fatRead - Read data from an open file
+ * 
+ * Reads up to 'size' bytes from the current position in the file.
+ * Advances the file position by the number of bytes read.
+ * 
+ * @handle: Pointer to open file handle
+ * @buffer: Buffer to read data into
+ * @size: Maximum number of bytes to read
+ * 
+ * Returns: Number of bytes read, or -1 on error
+ */
+int fatRead(FAT_FileHandle *handle, void *buffer, uint32_t size) {
+    if (!g_fat_state.initialized || !handle || !handle->is_open || !buffer) {
+        return -1;
+    }
+    
+    // Check if we're at end of file
+    if (handle->position >= handle->file_size) {
+        return 0;
+    }
+    
+    // Limit read size to remaining file size
+    if (handle->position + size > handle->file_size) {
+        size = handle->file_size - handle->position;
+    }
+    
+    uint32_t bytes_read = 0;
+    uint32_t cluster_size = g_fat_state.boot_sector.sectors_per_cluster * g_fat_state.boot_sector.bytes_per_sector;
+    
+    // Allocate temporary cluster buffer
+    uint8_t *cluster_buffer = (uint8_t*)kmalloc(cluster_size);
+    if (!cluster_buffer) {
+        return -1;
+    }
+    
+    while (bytes_read < size && handle->current_cluster != 0xFFFFFFFF) {
+        // Calculate offset within current cluster
+        uint32_t cluster_offset = handle->position % cluster_size;
+        uint32_t bytes_to_read = cluster_size - cluster_offset;
+        
+        if (bytes_to_read > size - bytes_read) {
+            bytes_to_read = size - bytes_read;
+        }
+        
+        // Read cluster from disk
+        uint32_t sector = cluster_to_sector(handle->current_cluster);
+        if (disk_read(sector, g_fat_state.boot_sector.sectors_per_cluster, cluster_buffer) != 0) {
+            kfree(cluster_buffer);
+            return -1;
+        }
+        
+        // Copy data to output buffer
+        memcpy((uint8_t*)buffer + bytes_read, cluster_buffer + cluster_offset, bytes_to_read);
+        
+        bytes_read += bytes_to_read;
+        handle->position += bytes_to_read;
+        
+        // Move to next cluster if needed
+        if ((handle->position % cluster_size) == 0 && bytes_read < size) {
+            handle->current_cluster = get_next_cluster(handle->current_cluster);
+        }
+    }
+    
+    kfree(cluster_buffer);
+    return bytes_read;
+}
 
-size_t strlen(const char *str) {
-    unsigned int len = 0;
-    while(str[len] != '\0') {
+// ============================================================================
+// STRING FUNCTIONS (freestanding implementations)
+// ============================================================================
+
+void* memcpy(void* dest, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dest;
+    const uint8_t* s = (const uint8_t*)src;
+
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+
+    return dest;
+}
+
+int memcmp(const void* s1, const void* s2, size_t n) {
+    const uint8_t* p1 = (const uint8_t*)s1;
+    const uint8_t* p2 = (const uint8_t*)s2;
+
+    for (size_t i = 0; i < n; i++) {
+        if (p1[i] != p2[i]) {
+            return p1[i] - p2[i];
+        }
+    }
+
+    return 0;
+}
+
+void* memset(void* s, int c, size_t n) {
+    uint8_t* p = (uint8_t*)s;
+
+    for (size_t i = 0; i < n; i++) {
+        p[i] = (uint8_t)c;
+    }
+
+    return s;
+}
+
+size_t strlen(const char* s) {
+    size_t len = 0;
+    while (s[len] != '\0') {
         len++;
     }
     return len;
 }
 
-int tolower(int c) {
-    if(c < 'a') { // Check if c is uppercase
-        c -= 'a' - 'A';
-    }
-    return c;
-}
-
-int isdig(int c) {
-    if((c >= '0') && (c <= '9')){
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
-
-
-
-/*---------------------------------------------------*/
-/*                                                   */
-/* This routine puts pad characters into the output  */
-/* buffer.                                           */
-/*                                                   */
-static void padding( const int l_flag)
-{
-   int i;
-
-   if (do_padding && l_flag && (len < num1))
-      for (i=len; i<num1; i++)
-          out_char( pad_character);
-   }
-
-/*---------------------------------------------------*/
-/*                                                   */
-/* This routine moves a string to the output buffer  */
-/* as directed by the padding and positioning flags. */
-/*                                                   */
-static void outs( charptr lp)
-{
-   if(lp == NULL)
-      lp = "(null)";
-   /* pad on left if needed                          */
-   len = strlen( lp);
-   padding( !left_flag);
-
-   /* Move string to the buffer                      */
-   while (*lp && num2--)
-      out_char( *lp++);
-
-   /* Pad on right if needed                         */
-   len = strlen( lp);
-   padding( left_flag);
-   }
-
-/*---------------------------------------------------*/
-/*                                                   */
-/* This routine moves a number to the output buffer  */
-/* as directed by the padding and positioning flags. */
-/*                                                   */
-static void outnum(unsigned int num, const int base)
-{
-   charptr cp;
-   int negative;
-   char outbuf[32];
-   const char digits[] = "0123456789ABCDEF";
-
-   /* Check if number is negative                    */
-   /* NAK 2009-07-29 Negate the number only if it is not a hex value. */
-   if (num < 0L && base != 16L) {
-      negative = 1;
-      num = -num;
-      }
-   else
-      negative = 0;
-
-   /* Build number (backwards) in outbuf             */
-   cp = outbuf;
-   do {
-      *cp++ = digits[num % base];
-      } while ((num /= base) > 0);
-   if (negative)
-      *cp++ = '-';
-   *cp-- = 0;
-
-   /* Move the converted number to the buffer and    */
-   /* add in the padding where needed.               */
-   len = strlen(outbuf);
-   padding( !left_flag);
-   while (cp >= outbuf)
-      out_char( *cp--);
-   padding( left_flag);
-}
-
-/*---------------------------------------------------*/
-/*                                                   */
-/* This routine gets a number from the format        */
-/* string.                                           */
-/*                                                   */
-static int getnum( charptr* linep)
-{
-   int n;
-   charptr cp;
-
-   n = 0;
-   cp = *linep;
-   while (isdig((int)*cp))
-      n = n*10 + ((*cp++) - '0');
-   *linep = cp;
-   return(n);
-}
-
-/*---------------------------------------------------*/
-/*                                                   */
-/* This routine operates just like a printf/sprintf  */
-/* routine. It outputs a set of data under the       */
-/* control of a formatting string. Not all of the    */
-/* standard C format control are supported. The ones */
-/* provided are primarily those needed for embedded  */
-/* systems work. Primarily the floaing point         */
-/* routines are omitted. Other formats could be      */
-/* added easily by following the examples shown for  */
-/* the supported formats.                            */
-/*                                                   */
-
-void esp_printf( const func_ptr f_ptr, charptr ctrl, ...){
-  va_list args;
-  va_start(args, *ctrl);
-  esp_vprintf(f_ptr, ctrl, args);
-  va_end( args );
-}
-
-void esp_vprintf( const func_ptr f_ptr, charptr ctrl, va_list argp)
-{
-
-   int long_flag;
-   int dot_flag;
-
-   char ch;
-   //va_list argp;
-
-   //va_start( argp, ctrl);
-   out_char = f_ptr;
-
-   for ( ; *ctrl; ctrl++) {
-
-      /* move format string chars to buffer until a  */
-      /* format control is found.                    */
-      if (*ctrl != '%') {
-         out_char(*ctrl);
-         continue;
-         }
-
-      /* initialize all the flags for this format.   */
-      dot_flag   =
-      long_flag  =
-      left_flag  =
-      do_padding = 0;
-      pad_character = ' ';
-      num2=32767;
-
-try_next:
-      ch = *(++ctrl);
-
-      if (isdig((int)ch)) {
-         if (dot_flag)
-            num2 = getnum(&ctrl);
-         else {
-            if (ch == '0')
-               pad_character = '0';
-
-            num1 = getnum(&ctrl);
-            do_padding = 1;
-         }
-         ctrl--;
-         goto try_next;
-      }
-
-      switch (tolower((int)ch)) {
-         case '%':
-              out_char( '%');
-              continue;
-
-         case '-':
-              left_flag = 1;
-              break;
-
-         case '.':
-              dot_flag = 1;
-              break;
-
-         case 'l':
-              long_flag = 1;
-              break;
-	
-         case 'i':
-         case 'd':
-              if (long_flag || ch == 'D') {
-                 outnum( va_arg(argp, long), 10L);
-                 continue;
-                 }
-              else {
-                 outnum( va_arg(argp, int), 10L);
-                 continue;
-                 }
-         case 'x':
-              outnum( (long)va_arg(argp, int), 16L);
-              continue;
-
-         case 's':
-              outs( va_arg( argp, charptr));
-              continue;
-
-         case 'c':
-              out_char( va_arg( argp, int));
-              continue;
-
-         case '\\':
-              switch (*ctrl) {
-                 case 'a':
-                      out_char( 0x07);
-                      break;
-                 case 'h':
-                      out_char( 0x08);
-                      break;
-                 case 'r':
-                      out_char( 0x0D);
-                      break;
-                 case 'n':
-                      out_char( 0x0D);
-                      out_char( 0x0A);
-                      break;
-                 default:
-                      out_char( *ctrl);
-                      break;
-                 }
-              ctrl++;
-              break;
-
-         default:
-              continue;
-         }
-      goto try_next;
-      }
-   va_end( argp);
-   }
-/*---------------------------------------------------*/
-
-
-
-
-
-
-
-
-// --- Constants for Screen Dimensions ---
-#define VIDEO_WIDTH 80  // Characters per line
-#define VIDEO_HEIGHT 25 // Lines on the screen
-#define BYTES_PER_CHAR 2 // Character and attribute byte
-
-// --- Function to write a single character ---
-void putc(int data) {
-    char character = (char)data; // Cast the input to a char
-   char *vram = (char*)0xb8000; // Base address of video mem
- int current_offset; // Tracks the current position in video memory
-    // Write the character to the video memory
-    vram[current_offset] = character;
-    // Write a default attribute byte (e.g., white on black)
-    vram[current_offset + 1] = 0x0F;
-
-    // Increment the offset to the next character position
-    current_offset += BYTES_PER_CHAR;
-
-    // Handle newline character
-    if (character == '\n') {
-        // Move to the beginning of the next line
-        current_offset = (current_offset / (VIDEO_WIDTH * BYTES_PER_CHAR)) * (VIDEO_WIDTH * BYTES_PER_CHAR);
-    }
-
-    // Handle screen wrap-around (optional, but good practice)
-    if (current_offset >= VIDEO_WIDTH * VIDEO_HEIGHT * BYTES_PER_CHAR) {
-        // If at the end of the screen, reset to the beginning of video memory
-        current_offset = 0;
-        // You might also want to scroll the entire screen content up here
-    }
-}
-
-void terminal_putc(char c) {
-    static volatile uint16_t* vga_buffer = (volatile uint16_t*)0xB8050;
-    static int terminal_col = 0;
-    static int terminal_row =0;
-
-    if (c == '\n') {
-        terminal_col = 0;
-        terminal_row++;
-    } else {
-        vga_buffer[terminal_row * 80 + terminal_col] = (uint16_t)'\07' << 8 | c;
-        terminal_col++;
-    }
-}
-
-
-uint32_t get_cpl() {
-    uint32_t cs;
-    asm volatile("movl %%cs, %0" : "=r"(cs));
-    return cs & 0x3;
-}
-
-
-
-
-
-// I/O port write function (not used here, but useful for PS/2 work)
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1"
-                      :
-                      : "a"(val), "Nd"(port));
-}
-
-// Check if output buffer of PS/2 controller is full
-bool is_output_buffer_full() {
-    uint8_t status = inb(0x64);  // PS/2 status register
-    return status & 0x01;        // Check LSB
-}
-
-// Entry point for reading scancode
-void read_scancode_once() {
-    if (is_output_buffer_full()) {
-        uint8_t scancode = inb(0x60);  // Read scancode from data port
-        // Print to terminal — assumes you have a way to print (e.g., via VGA or serial)
-    }
-}
-
-
-extern struct page_directory_entry pd[1024];
-extern struct page_entry pt[1024];
-
-void *map_pages(void *vaddr, struct ppage *pglist, struct page_directory_entry *pd)
-{
-    uint32_t va = (uint32_t)vaddr;
-    struct ppage *curr = pglist;
-
-    // Extract directory and table indices
-    uint32_t dir_index = (va >> 22) & 0x3FF;
-    uint32_t tbl_index = (va >> 12) & 0x3FF;
-
-    // If the page directory entry is not present, set it up
-    if (!pd[dir_index].present) {
-        pd[dir_index].present = 1;
-        pd[dir_index].rw = 1;        // Read/write
-        pd[dir_index].user = 0;      // Kernel-only
-        pd[dir_index].frame_number = ((uint32_t)&pt) >> 12;  // Page table physical addr
-    }
-
-    // Map each page in the list
-    while (curr != NULL) {
-        pt[tbl_index].present = 1;
-        pt[tbl_index].rw = 1;
-        pt[tbl_index].user = 0;
-        pt[tbl_index].frame_number = curr->frame_number;  // store high 20 bits
-
-        // Move to next page
-        curr = curr->next;
-        tbl_index++;
-
-        // Handle page table overflow (rare)
-        if (tbl_index >= 1024) {
-            dir_index++;
-            tbl_index = 0;
-            // In a full implementation, allocate a new page table here
+char* strchr(const char* s, int c) {
+    while (*s != '\0') {
+        if (*s == (char)c) {
+            return (char*)s;
         }
+        s++;
     }
 
-    return vaddr;
+    if (c == '\0') {
+        return (char*)s;
+    }
+
+    return NULL;
 }
 
-extern char _end_kernel;
+// ============================================================================
+// SIMPLE MEMORY ALLOCATOR
+// ============================================================================
 
-static inline void load_page_directory(uint32_t *pd_phys_addr)
-{
-    asm volatile("mov %0, %%cr3" :: "r"(pd_phys_addr) : "memory");
+// Simple bump allocator for kernel (you should replace with a proper allocator)
+#define HEAP_SIZE (1024 * 1024)  // 1MB heap
+static uint8_t heap[HEAP_SIZE];
+static size_t heap_offset = 0;
+
+void* kmalloc(size_t size) {
+    // Align to 4-byte boundary
+    size = (size + 3) & ~3;
+
+    if (heap_offset + size > HEAP_SIZE) {
+        return NULL;  // Out of memory
+    }
+
+    void* ptr = &heap[heap_offset];
+    heap_offset += size;
+
+    return ptr;
 }
 
-void loadPageDirectory(struct page_directory_entry *pd) {
-    asm volatile (
-        "mov %0, %%cr3"  // Load the physical address of the page directory into CR3
-        :
-        : "r"(pd)        // Input: The page directory address
-        : "memory"       // Clobber memory since we are modifying a control register
-    );
+void kfree(void* ptr) {
+    // Simple bump allocator doesn't support freeing
+    // You should implement a proper allocator (like a linked list or buddy system)
+    (void)ptr;
 }
 
-void enable_paging(void) {
-    asm volatile (
-        "mov %%cr0, %%eax\n"        // Load CR0 into EAX
-        "or $0x80000001, %%eax\n"   // Set bit 31 (paging) and bit 0 (protected mode)
-        "mov %%eax, %%cr0\n"        // Store the modified value back to CR0
-        :                           // No output operands
-        :                           // No input operands
-        : "%eax"                    // Clobber EAX register
-    );
+// Port I/O functions
+static inline void outb(uint16_t port, uint8_t value) {
+    __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static inline void inw_rep(uint16_t port, void* buffer, uint32_t count) {
+    __asm__ volatile ("rep insw" : "+D"(buffer), "+c"(count) : "d"(port) : "memory");
+}
+
+// ATA PIO disk reading
+#define ATA_PRIMARY_IO 0x1F0
+#define ATA_DATA        (ATA_PRIMARY_IO + 0)
+#define ATA_SECTOR_COUNT (ATA_PRIMARY_IO + 2)
+#define ATA_LBA_LOW     (ATA_PRIMARY_IO + 3)
+#define ATA_LBA_MID     (ATA_PRIMARY_IO + 4)
+#define ATA_LBA_HIGH    (ATA_PRIMARY_IO + 5)
+#define ATA_DRIVE       (ATA_PRIMARY_IO + 6)
+#define ATA_COMMAND     (ATA_PRIMARY_IO + 7)
+#define ATA_STATUS      (ATA_PRIMARY_IO + 7)
+#define ATA_CMD_READ_PIO 0x20
+#define ATA_STATUS_BSY   0x80
+#define ATA_STATUS_DRQ   0x08
+
+int disk_read(uint32_t sector, uint32_t count, void* buffer) {
+    if (count == 0 || count > 256) return -1;
+
+    uint8_t* buf = (uint8_t*)buffer;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lba = sector + i;
+
+        // Wait for disk to be ready
+        for (int j = 0; j < 1000; j++) {
+            if (!(inb(ATA_STATUS) & ATA_STATUS_BSY)) break;
+        }
+
+        // Send read command
+        outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+        outb(ATA_SECTOR_COUNT, 1);
+        outb(ATA_LBA_LOW, lba & 0xFF);
+        outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
+        outb(ATA_LBA_HIGH, (lba >> 16) & 0xFF);
+        outb(ATA_COMMAND, ATA_CMD_READ_PIO);
+
+        // Wait for data ready
+        for (int j = 0; j < 1000000; j++) {
+            uint8_t status = inb(ATA_STATUS);
+            if (!(status & ATA_STATUS_BSY) && (status & ATA_STATUS_DRQ)) break;
+        }
+
+        // Read 512 bytes
+        inw_rep(ATA_DATA, buf + (i * 512), 256);
+
+        // Delay
+        for (int j = 0; j < 4; j++) inb(ATA_STATUS);
+    }
+
+    return 0;
 }
 
 void main() {
@@ -466,46 +574,205 @@ void main() {
     const char color = 7; // gray text on black background
     int current_offset = 0;
 
-uint32_t start_addr = 0x100000;              // 1 MB
-    uint32_t end_addr   = (uint32_t)&_end_kernel;
 
-    for (uint32_t addr = start_addr; addr < end_addr; addr += 0x1000) {
-    struct ppage tmp;
-    tmp.next = NULL;
-    tmp.frame_number = addr;   // ✅ physical == virtual
-    map_pages((void *)addr, &tmp, pd);
-}
+    print_string("Kernel starting...\n");
+    print_string("Initializing FAT filesystem...\n");
 
-struct page_directory_entry pd[1024];  // Array of 1024 page directory entries
-struct page_entry pt[1024];  // Array of 1024 page table entries
-
-
-    // (b) Identity map the kernel stack
-    uint32_t esp;
-    asm("mov %%esp, %0" : "=r"(esp));
-
-    // Align the stack base down to a page boundary
-    uint32_t stack_page = esp & 0xFFFFF000;
-
-    // Map, for example, 4 stack pages (16 KB)
-    for (int i = 0; i < 4; i++) {
-        struct ppage tmp;
-        tmp.next = NULL;
-        tmp.frame_number = stack_page - (i * 0x1000);
-        map_pages((void *)(stack_page - (i * 0x1000)), &tmp, pd);
+    // Initialize the FAT filesystem
+    if (fatInit() != 0) {
+        print_string("ERROR: Failed to initialize FAT filesystem!\n");
+        print_string("Make sure there's a FAT-formatted disk attached.\n");
+        goto halt;
     }
 
-    // (c) Identity map VGA text buffer (0xB8000)
-    {
-        struct ppage tmp;
-        tmp.next = NULL;
-        tmp.frame_number = 0xB8000;
-        map_pages((void *)0xB8000, &tmp, pd);
+    print_string("FAT filesystem initialized successfully!\n\n");
+
+    // ========================================================================
+    // Example 1: Read a simple text file
+    // ========================================================================
+    print_string("=== Example 1: Reading README.TXT ===\n");
+
+    FAT_FileHandle readme_file;
+    if (fatOpen("README.TXT", &readme_file) == 0) {
+        print_string("Successfully opened README.TXT\n");
+        print_string("File size: ");
+        print_dec(readme_file.file_size);
+        print_string(" bytes\n\n");
+
+        // Read and display the first 512 bytes
+        char buffer[512];
+        int bytes_read = fatRead(&readme_file, buffer, sizeof(buffer));
+
+        if (bytes_read > 0) {
+            print_string("Content:\n");
+            print_string("----------------------------------------\n");
+            for (int i = 0; i < bytes_read; i++) {
+                kputchar(buffer[i]);
+            }
+            print_string("\n----------------------------------------\n");
+        } else {
+            print_string("ERROR: Failed to read file!\n");
+        }
+    } else {
+        print_string("Could not open README.TXT (file may not exist)\n");
     }
 
-load_page_directory((uint32_t *)pd);
-enable_paging();
+    print_string("\n");
 
-    while(1) {
+    // ========================================================================
+    // Example 2: Read a binary file (like a kernel module)
+    // ========================================================================
+    print_string("=== Example 2: Reading KERNEL.BIN ===\n");
+
+    FAT_FileHandle kernel_file;
+    if (fatOpen("KERNEL.BIN", &kernel_file) == 0) {
+        print_string("Successfully opened KERNEL.BIN\n");
+        print_string("File size: ");
+        print_dec(kernel_file.file_size);
+        print_string(" bytes\n");
+
+        // Read first 16 bytes and display as hex dump
+        uint8_t header[16];
+        int bytes_read = fatRead(&kernel_file, header, sizeof(header));
+
+        if (bytes_read > 0) {
+            print_string("First 16 bytes (hex):\n");
+            for (int i = 0; i < bytes_read; i++) {
+                if (header[i] < 0x10) kputchar('0');
+                print_hex(header[i]);
+                kputchar(' ');
+                if ((i + 1) % 8 == 0) kputchar('\n');
+            }
+            print_string("\n");
+        }
+    } else {
+        print_string("Could not open KERNEL.BIN\n");
+    }
+
+    print_string("\n");
+
+    // ========================================================================
+    // Example 3: Read a file in chunks (useful for large files)
+    // ========================================================================
+    print_string("=== Example 3: Reading DATA.DAT in chunks ===\n");
+
+    FAT_FileHandle data_file;
+    if (fatOpen("DATA.DAT", &data_file) == 0) {
+        print_string("Successfully opened DATA.DAT\n");
+        print_string("File size: ");
+        print_dec(data_file.file_size);
+        print_string(" bytes\n");
+
+        // Read file in 256-byte chunks
+        uint8_t chunk[256];
+        uint32_t total_read = 0;
+        int chunk_num = 0;
+
+        while (data_file.position < data_file.file_size) {
+            int bytes_read = fatRead(&data_file, chunk, sizeof(chunk));
+
+            if (bytes_read <= 0) {
+                print_string("Error reading chunk!\n");
+                break;
+            }
+
+            total_read += bytes_read;
+            chunk_num++;
+
+            // Process chunk here (for demo, just count it)
+        }
+
+        print_string("Read ");
+        print_dec(chunk_num);
+        print_string(" chunks (");
+        print_dec(total_read);
+        print_string(" bytes total)\n");
+    } else {
+        print_string("Could not open DATA.DAT\n");
+    }
+
+    print_string("\n");
+
+    // ========================================================================
+    // Example 4: Load a file into memory at a specific address
+    // ========================================================================
+    print_string("=== Example 4: Loading PROGRAM.BIN into memory ===\n");
+
+    FAT_FileHandle program_file;
+    if (fatOpen("PROGRAM.BIN", &program_file) == 0) {
+        print_string("Successfully opened PROGRAM.BIN\n");
+
+        // Allocate memory for the entire file
+        void* program_memory = kmalloc(program_file.file_size);
+
+        if (program_memory) {
+            // Read entire file into memory
+            int bytes_read = fatRead(&program_file, program_memory, program_file.file_size);
+
+            if (bytes_read == (int)program_file.file_size) {
+                print_string("Successfully loaded ");
+                print_dec(bytes_read);
+                print_string(" bytes at address ");
+                print_hex((uint32_t)program_memory);
+                print_string("\n");
+
+                // Now you could execute it or process it
+                // For example, if it's a function:
+                // void (*program_func)() = (void(*)())program_memory;
+                // program_func();
+
+            } else {
+                print_string("ERROR: Failed to read complete file!\n");
+            }
+
+            // Don't forget to free when done (if your kfree works)
+            // kfree(program_memory);
+        } else {
+            print_string("ERROR: Failed to allocate memory!\n");
+        }
+    } else {
+        print_string("Could not open PROGRAM.BIN\n");
+    }
+
+    print_string("\n");
+
+    // ========================================================================
+    // Example 5: Verify file contents
+    // ========================================================================
+    print_string("=== Example 5: Verifying CONFIG.TXT ===\n");
+
+    FAT_FileHandle config_file;
+    if (fatOpen("CONFIG.TXT", &config_file) == 0) {
+        char line_buffer[128];
+        int bytes_read = fatRead(&config_file, line_buffer, sizeof(line_buffer) - 1);
+
+        if (bytes_read > 0) {
+            line_buffer[bytes_read] = '\0';  // Null terminate
+
+            print_string("Configuration loaded:\n");
+            print_string(line_buffer);
+            print_string("\n");
+
+            // You could parse configuration here
+            // e.g., look for "resolution=1024x768" etc.
+        }
+    } else {
+        print_string("Could not open CONFIG.TXT (using defaults)\n");
+    }
+
+    print_string("\n");
+
+    // ========================================================================
+    // Done!
+    // ========================================================================
+    print_string("=== FAT filesystem demo complete! ===\n");
+    print_string("All file operations successful.\n\n");
+
+halt:
+    print_string("Kernel halting.\n");
+
+    // Halt the CPU
+    while (1) {
+        __asm__ volatile ("hlt");
     }
 }		
